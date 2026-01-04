@@ -3,12 +3,11 @@ Modular Schema Graph Builder
 
 Extracts schema from PostgreSQL databases (including Supabase) and builds a knowledge graph in Neo4j.
 Includes column statistics: distinct count, sample values, null percentage.
+Uses async I/O for concurrent stats fetching.
 """
 
-from abc import ABC, abstractmethod
+import asyncio
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
 from neo4j import GraphDatabase
 
 
@@ -20,19 +19,9 @@ class PostgresCredentials:
     user: str
     password: str
     
-    @property
-    def dsn(self) -> str:
-        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
-    
     @classmethod
     def from_supabase(cls, project_ref: str, password: str, region: str = "us-east-1") -> "PostgresCredentials":
-        """Create credentials for a Supabase project using the connection pooler.
-        
-        Args:
-            project_ref: Your project reference (e.g., 'gjmssqesjbwcboybclbl')
-            password: Database password from Supabase dashboard
-            region: AWS region (check dashboard, e.g., 'us-east-1', 'ap-southeast-1')
-        """
+        """Create credentials for a Supabase project using the connection pooler."""
         return cls(
             host=f"aws-1-{region}.pooler.supabase.com",
             port=5432,
@@ -49,42 +38,8 @@ class Neo4jCredentials:
     password: str
 
 
-class DatabaseConnector(ABC):
-    """Abstract base class for database connectors."""
-    
-    @abstractmethod
-    def connect(self) -> None:
-        pass
-    
-    @abstractmethod
-    def close(self) -> None:
-        pass
-    
-    @abstractmethod
-    def fetch_tables(self) -> list[dict]:
-        """Returns list of dicts: name, row_count"""
-        pass
-    
-    @abstractmethod
-    def fetch_columns(self) -> list[dict]:
-        """Returns list of dicts: table, name, type, nullable, default, is_pk"""
-        pass
-    
-    @abstractmethod
-    def fetch_foreign_keys(self) -> list[dict]:
-        """Returns list of dicts: table, column, ref_table, ref_col"""
-        pass
-    
-    @abstractmethod
-    def fetch_column_stats(self, table: str, column: str, col_type: str) -> dict:
-        """Returns dict: distinct_count, sample_values, null_count, total_count"""
-        pass
-
-
-class PostgresConnector(DatabaseConnector):
-    """Connector for PostgreSQL databases (including Supabase)."""
-    
-    DEFAULT_MAX_WORKERS = 5
+class PostgresConnector:
+    """Async connector for PostgreSQL databases (including Supabase)."""
     
     SCHEMA_SQL = """
     SELECT t.table_name, c.column_name, c.data_type, c.is_nullable,
@@ -114,154 +69,110 @@ class PostgresConnector(DatabaseConnector):
     WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public';
     """
     
-    def __init__(self, credentials: PostgresCredentials, max_workers: int = None):
+    def __init__(self, credentials: PostgresCredentials, max_concurrency: int = 10):
         self.credentials = credentials
-        self._conn = None
-        self.max_workers = max_workers or self.DEFAULT_MAX_WORKERS
-        self._pool: Queue = None
+        self.max_concurrency = max_concurrency
+        self._pool = None
     
-    def connect(self) -> None:
-        import psycopg2
-        self._conn = psycopg2.connect(self.credentials.dsn, sslmode="require")
+    async def connect(self) -> None:
+        import asyncpg
+        self._pool = await asyncpg.create_pool(
+            host=self.credentials.host,
+            port=self.credentials.port,
+            database=self.credentials.database,
+            user=self.credentials.user,
+            password=self.credentials.password,
+            ssl="require",
+            min_size=1,
+            max_size=self.max_concurrency
+        )
     
-    def _new_connection(self):
-        """Create a new database connection."""
-        import psycopg2
-        return psycopg2.connect(self.credentials.dsn, sslmode="require")
-    
-    def _init_pool(self):
-        """Initialize connection pool for parallel operations."""
-        self._pool = Queue()
-        for _ in range(self.max_workers):
-            self._pool.put(self._new_connection())
-    
-    def _close_pool(self):
-        """Close all connections in the pool."""
+    async def close(self) -> None:
         if self._pool:
-            while not self._pool.empty():
-                try:
-                    conn = self._pool.get_nowait()
-                    conn.close()
-                except:
-                    pass
+            await self._pool.close()
             self._pool = None
     
-    def close(self) -> None:
-        self._close_pool()
-        if self._conn:
-            self._conn.close()
-            self._conn = None
-    
-    def _execute(self, sql: str, params: tuple = None) -> list[tuple]:
-        with self._conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
-    
-    def fetch_tables(self) -> list[dict]:
+    async def fetch_tables(self) -> list[dict]:
         """Fetch tables with row counts."""
-        rows = self._execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
-        )
-        tables = []
-        for (name,) in rows:
-            count_result = self._execute(f'SELECT COUNT(*) FROM "{name}"')
-            tables.append({"name": name, "row_count": count_result[0][0]})
-        return tables
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+            )
+            tables = []
+            for row in rows:
+                name = row["table_name"]
+                count = await conn.fetchval(f'SELECT COUNT(*) FROM "{name}"')
+                tables.append({"name": name, "row_count": count})
+            return tables
     
-    def fetch_columns(self) -> list[dict]:
-        rows = self._execute(self.SCHEMA_SQL)
-        return [
-            {"table": r[0], "name": r[1], "type": r[2], 
-             "nullable": r[3] == "YES", "default": r[4], "is_pk": r[5]}
-            for r in rows
-        ]
+    async def fetch_columns(self) -> list[dict]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(self.SCHEMA_SQL)
+            return [
+                {"table": r["table_name"], "name": r["column_name"], "type": r["data_type"],
+                 "nullable": r["is_nullable"] == "YES", "default": r["column_default"], "is_pk": r["is_pk"]}
+                for r in rows
+            ]
     
-    def fetch_foreign_keys(self) -> list[dict]:
-        rows = self._execute(self.FK_SQL)
-        return [
-            {"table": r[0], "column": r[1], "ref_table": r[2], "ref_col": r[3]}
-            for r in rows
-        ]
+    async def fetch_foreign_keys(self) -> list[dict]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(self.FK_SQL)
+            return [
+                {"table": r["table_name"], "column": r["column_name"],
+                 "ref_table": r["ref_table"], "ref_col": r["ref_column"]}
+                for r in rows
+            ]
     
-    def fetch_column_stats(self, table: str, column: str, col_type: str) -> dict:
-        """Fetch column statistics: distinct count, sample values, null stats."""
-        return self._fetch_stats_with_conn(self._conn, table, column, col_type)
-    
-    def _fetch_stats_with_conn(self, conn, table: str, column: str, col_type: str) -> dict:
-        """Fetch column statistics using a specific connection."""
-        stats = {"distinct_count": 0, "sample_values": [], "null_count": 0, "total_count": 0}
-        
-        def execute(sql):
-            with conn.cursor() as cur:
-                cur.execute(sql)
-                return cur.fetchall()
-        
-        try:
-            # Get total and null counts
-            count_sql = f'''
-                SELECT COUNT(*) as total, 
-                       COUNT(*) - COUNT("{column}") as nulls
-                FROM "{table}"
-            '''
-            result = execute(count_sql)
-            stats["total_count"] = result[0][0]
-            stats["null_count"] = result[0][1]
+    async def _fetch_column_stats(self, col: dict, semaphore: asyncio.Semaphore) -> dict:
+        """Fetch stats for a single column with concurrency limit."""
+        async with semaphore:
+            table, column, col_type = col["table"], col["name"], col["type"]
+            stats = {"distinct_count": 0, "sample_values": [], "null_count": 0, "total_count": 0}
             
-            # Get distinct count
-            distinct_sql = f'SELECT COUNT(DISTINCT "{column}") FROM "{table}"'
-            result = execute(distinct_sql)
-            stats["distinct_count"] = result[0][0]
-            
-            # Get sample values (top 5 most common non-null values)
-            # Skip for binary/bytea types
-            skip_types = ('bytea', 'json', 'jsonb', 'xml')
-            if not any(t in col_type.lower() for t in skip_types):
-                sample_sql = f'''
-                    SELECT "{column}"::text, COUNT(*) as freq 
-                    FROM "{table}" 
-                    WHERE "{column}" IS NOT NULL 
-                    GROUP BY "{column}" 
-                    ORDER BY freq DESC 
-                    LIMIT 5
-                '''
-                result = execute(sample_sql)
-                stats["sample_values"] = [r[0] for r in result if r[0] is not None]
-        except Exception as e:
-            print(f"Warning: Could not fetch stats for {table}.{column}: {e}")
-        
-        return stats
-    
-    def fetch_all_column_stats(self, columns: list[dict]) -> list[dict]:
-        """Fetch statistics for all columns in parallel using a connection pool."""
-        if not columns:
-            return columns
-        
-        self._init_pool()
-        
-        def fetch_single(col: dict) -> dict:
-            conn = self._pool.get()
             try:
-                stats = self._fetch_stats_with_conn(conn, col["table"], col["name"], col["type"])
-                return {**col, **stats}
-            finally:
-                self._pool.put(conn)
-        
-        try:
-            enriched = []
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = {executor.submit(fetch_single, col): i for i, col in enumerate(columns)}
-                for future in as_completed(futures):
-                    enriched.append(future.result())
-            return enriched
-        finally:
-            self._close_pool()
+                async with self._pool.acquire() as conn:
+                    # Get total and null counts
+                    row = await conn.fetchrow(f'''
+                        SELECT COUNT(*) as total, COUNT(*) - COUNT("{column}") as nulls
+                        FROM "{table}"
+                    ''')
+                    stats["total_count"] = row["total"]
+                    stats["null_count"] = row["nulls"]
+                    
+                    # Get distinct count
+                    stats["distinct_count"] = await conn.fetchval(
+                        f'SELECT COUNT(DISTINCT "{column}") FROM "{table}"'
+                    )
+                    
+                    # Get sample values (skip binary types)
+                    skip_types = ('bytea', 'json', 'jsonb', 'xml')
+                    if not any(t in col_type.lower() for t in skip_types):
+                        rows = await conn.fetch(f'''
+                            SELECT "{column}"::text as val, COUNT(*) as freq 
+                            FROM "{table}" 
+                            WHERE "{column}" IS NOT NULL 
+                            GROUP BY "{column}" 
+                            ORDER BY freq DESC 
+                            LIMIT 5
+                        ''')
+                        stats["sample_values"] = [r["val"] for r in rows if r["val"] is not None]
+            except Exception as e:
+                print(f"Warning: Could not fetch stats for {table}.{column}: {e}")
+            
+            return {**col, **stats}
+    
+    async def fetch_all_column_stats(self, columns: list[dict]) -> list[dict]:
+        """Fetch statistics for all columns concurrently."""
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+        tasks = [self._fetch_column_stats(col, semaphore) for col in columns]
+        return await asyncio.gather(*tasks)
 
 
 class SchemaGraphBuilder:
-    """Builds a Neo4j schema graph from any supported database."""
+    """Builds a Neo4j schema graph from a PostgreSQL database."""
     
-    def __init__(self, db_connector: DatabaseConnector, neo4j_credentials: Neo4jCredentials):
+    def __init__(self, db_connector: PostgresConnector, neo4j_credentials: Neo4jCredentials):
         self.connector = db_connector
         self.neo4j_creds = neo4j_credentials
         self._driver = None
@@ -272,31 +183,24 @@ class SchemaGraphBuilder:
             auth=(self.neo4j_creds.user, self.neo4j_creds.password)
         )
     
-    def close(self) -> None:
-        self.connector.close()
+    async def close(self) -> None:
+        await self.connector.close()
         if self._driver:
             self._driver.close()
     
-    def build(self, graph_name: str = "schema", clear: bool = True, include_stats: bool = True) -> dict:
-        """Extract schema and build Neo4j graph.
-        
-        Args:
-            graph_name: Name for the database node
-            clear: Whether to clear existing schema nodes
-            include_stats: Whether to fetch column statistics (slower but more info)
-        """
-        self.connector.connect()
+    async def build(self, graph_name: str = "schema", clear: bool = True, include_stats: bool = True) -> dict:
+        """Extract schema and build Neo4j graph."""
+        await self.connector.connect()
         self._connect_neo4j()
         
         try:
-            tables = self.connector.fetch_tables()
-            columns = self.connector.fetch_columns()
-            fks = self.connector.fetch_foreign_keys()
+            tables = await self.connector.fetch_tables()
+            columns = await self.connector.fetch_columns()
+            fks = await self.connector.fetch_foreign_keys()
             
-            # Enrich columns with statistics
             if include_stats:
-                print(f"Fetching column statistics for {len(columns)} columns ({self.connector.max_workers} workers)...")
-                columns = self.connector.fetch_all_column_stats(columns)
+                print(f"Fetching column statistics for {len(columns)} columns...")
+                columns = await self.connector.fetch_all_column_stats(columns)
             
             self._build_graph(graph_name, tables, columns, fks, clear)
             
@@ -308,7 +212,7 @@ class SchemaGraphBuilder:
                 "total_rows": sum(t["row_count"] for t in tables)
             }
         finally:
-            self.close()
+            await self.close()
     
     def _build_graph(self, name: str, tables: list, columns: list, fks: list, clear: bool):
         if clear:
@@ -318,7 +222,6 @@ class SchemaGraphBuilder:
         
         self._driver.execute_query("MERGE (:Database {name: $name})", name=name)
         
-        # Create Table nodes with row_count
         self._driver.execute_query("""
             MATCH (d:Database {name: $db})
             UNWIND $tables AS tbl
@@ -327,7 +230,6 @@ class SchemaGraphBuilder:
             MERGE (d)-[:HAS_TABLE]->(t)
         """, db=name, tables=tables)
         
-        # Create Column nodes with all stats
         self._driver.execute_query("""
             UNWIND $columns AS col
             MATCH (t:Table {name: col.table})
@@ -352,47 +254,33 @@ class SchemaGraphBuilder:
             """, fks=fks)
 
 
-def create_builder(credentials: PostgresCredentials, neo4j_credentials: Neo4jCredentials, max_workers: int = 5) -> SchemaGraphBuilder:
+def create_builder(credentials: PostgresCredentials, neo4j_credentials: Neo4jCredentials, max_concurrency: int = 10) -> SchemaGraphBuilder:
     """Factory function to create a SchemaGraphBuilder.
     
     Args:
-        credentials: PostgreSQL credentials
-        neo4j_credentials: Neo4j credentials  
-        max_workers: Number of parallel connections for fetching column stats (default: 5)
+        max_concurrency: Max concurrent database queries (default: 10)
     """
-    connector = PostgresConnector(credentials, max_workers=max_workers)
+    connector = PostgresConnector(credentials, max_concurrency=max_concurrency)
     return SchemaGraphBuilder(connector, neo4j_credentials)
 
 
-# =============================================================================
-# Usage Examples
-# =============================================================================
-
-if __name__ == "__main__":
+async def main():
     neo4j_creds = Neo4jCredentials(
         uri="bolt://localhost:7687",
         user="neo4j",
         password="password"
     )
     
-    # Option 1: Direct PostgreSQL
-    # pg_creds = PostgresCredentials(
-    #     host="localhost",
-    #     port=5432,
-    #     database="mydb",
-    #     user="postgres",
-    #     password="password"
-    # )
-    
-    # Option 2: Supabase (uses connection pooler for IPv4 compatibility)
     pg_creds = PostgresCredentials.from_supabase(
-        project_ref="",
-        password="",
+        project_ref="gjmssqesjbwcboybclbl",
+        password="nIFcTJbRNZ8ITnZE",
         region="ap-southeast-1"
     )
     
-    builder = create_builder(pg_creds, neo4j_creds, max_workers=5)
-    
-    # Set include_stats=False for faster extraction without column statistics
-    result = builder.build("my_database", include_stats=True)
+    builder = create_builder(pg_creds, neo4j_creds, max_concurrency=10)
+    result = await builder.build("my_database", include_stats=True)
     print(f"Built: {result}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
