@@ -2,10 +2,13 @@
 Modular Schema Graph Builder
 
 Extracts schema from PostgreSQL databases (including Supabase) and builds a knowledge graph in Neo4j.
+Includes column statistics: distinct count, sample values, null percentage.
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
 from neo4j import GraphDatabase
 
 
@@ -28,11 +31,11 @@ class PostgresCredentials:
         Args:
             project_ref: Your project reference (e.g., 'gjmssqesjbwcboybclbl')
             password: Database password from Supabase dashboard
-            region: AWS region (check dashboard, e.g., 'us-east-1', 'us-west-1', 'ap-southeast-1')
+            region: AWS region (check dashboard, e.g., 'us-east-1', 'ap-southeast-1')
         """
         return cls(
             host=f"aws-1-{region}.pooler.supabase.com",
-            port=5432,  # Session mode (supports prepared statements)
+            port=5432,
             database="postgres",
             user=f"postgres.{project_ref}",
             password=password
@@ -58,7 +61,8 @@ class DatabaseConnector(ABC):
         pass
     
     @abstractmethod
-    def fetch_tables(self) -> list[str]:
+    def fetch_tables(self) -> list[dict]:
+        """Returns list of dicts: name, row_count"""
         pass
     
     @abstractmethod
@@ -70,10 +74,17 @@ class DatabaseConnector(ABC):
     def fetch_foreign_keys(self) -> list[dict]:
         """Returns list of dicts: table, column, ref_table, ref_col"""
         pass
+    
+    @abstractmethod
+    def fetch_column_stats(self, table: str, column: str, col_type: str) -> dict:
+        """Returns dict: distinct_count, sample_values, null_count, total_count"""
+        pass
 
 
 class PostgresConnector(DatabaseConnector):
     """Connector for PostgreSQL databases (including Supabase)."""
+    
+    DEFAULT_MAX_WORKERS = 5
     
     SCHEMA_SQL = """
     SELECT t.table_name, c.column_name, c.data_type, c.is_nullable,
@@ -103,30 +114,60 @@ class PostgresConnector(DatabaseConnector):
     WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public';
     """
     
-    def __init__(self, credentials: PostgresCredentials):
+    def __init__(self, credentials: PostgresCredentials, max_workers: int = None):
         self.credentials = credentials
         self._conn = None
+        self.max_workers = max_workers or self.DEFAULT_MAX_WORKERS
+        self._pool: Queue = None
     
     def connect(self) -> None:
         import psycopg2
         self._conn = psycopg2.connect(self.credentials.dsn, sslmode="require")
     
+    def _new_connection(self):
+        """Create a new database connection."""
+        import psycopg2
+        return psycopg2.connect(self.credentials.dsn, sslmode="require")
+    
+    def _init_pool(self):
+        """Initialize connection pool for parallel operations."""
+        self._pool = Queue()
+        for _ in range(self.max_workers):
+            self._pool.put(self._new_connection())
+    
+    def _close_pool(self):
+        """Close all connections in the pool."""
+        if self._pool:
+            while not self._pool.empty():
+                try:
+                    conn = self._pool.get_nowait()
+                    conn.close()
+                except:
+                    pass
+            self._pool = None
+    
     def close(self) -> None:
+        self._close_pool()
         if self._conn:
             self._conn.close()
             self._conn = None
     
-    def _execute(self, sql: str) -> list[tuple]:
+    def _execute(self, sql: str, params: tuple = None) -> list[tuple]:
         with self._conn.cursor() as cur:
-            cur.execute(sql)
+            cur.execute(sql, params)
             return cur.fetchall()
     
-    def fetch_tables(self) -> list[str]:
+    def fetch_tables(self) -> list[dict]:
+        """Fetch tables with row counts."""
         rows = self._execute(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
         )
-        return [r[0] for r in rows]
+        tables = []
+        for (name,) in rows:
+            count_result = self._execute(f'SELECT COUNT(*) FROM "{name}"')
+            tables.append({"name": name, "row_count": count_result[0][0]})
+        return tables
     
     def fetch_columns(self) -> list[dict]:
         rows = self._execute(self.SCHEMA_SQL)
@@ -142,6 +183,79 @@ class PostgresConnector(DatabaseConnector):
             {"table": r[0], "column": r[1], "ref_table": r[2], "ref_col": r[3]}
             for r in rows
         ]
+    
+    def fetch_column_stats(self, table: str, column: str, col_type: str) -> dict:
+        """Fetch column statistics: distinct count, sample values, null stats."""
+        return self._fetch_stats_with_conn(self._conn, table, column, col_type)
+    
+    def _fetch_stats_with_conn(self, conn, table: str, column: str, col_type: str) -> dict:
+        """Fetch column statistics using a specific connection."""
+        stats = {"distinct_count": 0, "sample_values": [], "null_count": 0, "total_count": 0}
+        
+        def execute(sql):
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                return cur.fetchall()
+        
+        try:
+            # Get total and null counts
+            count_sql = f'''
+                SELECT COUNT(*) as total, 
+                       COUNT(*) - COUNT("{column}") as nulls
+                FROM "{table}"
+            '''
+            result = execute(count_sql)
+            stats["total_count"] = result[0][0]
+            stats["null_count"] = result[0][1]
+            
+            # Get distinct count
+            distinct_sql = f'SELECT COUNT(DISTINCT "{column}") FROM "{table}"'
+            result = execute(distinct_sql)
+            stats["distinct_count"] = result[0][0]
+            
+            # Get sample values (top 5 most common non-null values)
+            # Skip for binary/bytea types
+            skip_types = ('bytea', 'json', 'jsonb', 'xml')
+            if not any(t in col_type.lower() for t in skip_types):
+                sample_sql = f'''
+                    SELECT "{column}"::text, COUNT(*) as freq 
+                    FROM "{table}" 
+                    WHERE "{column}" IS NOT NULL 
+                    GROUP BY "{column}" 
+                    ORDER BY freq DESC 
+                    LIMIT 5
+                '''
+                result = execute(sample_sql)
+                stats["sample_values"] = [r[0] for r in result if r[0] is not None]
+        except Exception as e:
+            print(f"Warning: Could not fetch stats for {table}.{column}: {e}")
+        
+        return stats
+    
+    def fetch_all_column_stats(self, columns: list[dict]) -> list[dict]:
+        """Fetch statistics for all columns in parallel using a connection pool."""
+        if not columns:
+            return columns
+        
+        self._init_pool()
+        
+        def fetch_single(col: dict) -> dict:
+            conn = self._pool.get()
+            try:
+                stats = self._fetch_stats_with_conn(conn, col["table"], col["name"], col["type"])
+                return {**col, **stats}
+            finally:
+                self._pool.put(conn)
+        
+        try:
+            enriched = []
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {executor.submit(fetch_single, col): i for i, col in enumerate(columns)}
+                for future in as_completed(futures):
+                    enriched.append(future.result())
+            return enriched
+        finally:
+            self._close_pool()
 
 
 class SchemaGraphBuilder:
@@ -163,8 +277,14 @@ class SchemaGraphBuilder:
         if self._driver:
             self._driver.close()
     
-    def build(self, graph_name: str = "schema", clear: bool = True) -> dict:
-        """Extract schema and build Neo4j graph."""
+    def build(self, graph_name: str = "schema", clear: bool = True, include_stats: bool = True) -> dict:
+        """Extract schema and build Neo4j graph.
+        
+        Args:
+            graph_name: Name for the database node
+            clear: Whether to clear existing schema nodes
+            include_stats: Whether to fetch column statistics (slower but more info)
+        """
         self.connector.connect()
         self._connect_neo4j()
         
@@ -173,13 +293,19 @@ class SchemaGraphBuilder:
             columns = self.connector.fetch_columns()
             fks = self.connector.fetch_foreign_keys()
             
+            # Enrich columns with statistics
+            if include_stats:
+                print(f"Fetching column statistics for {len(columns)} columns ({self.connector.max_workers} workers)...")
+                columns = self.connector.fetch_all_column_stats(columns)
+            
             self._build_graph(graph_name, tables, columns, fks, clear)
             
             return {
                 "graph": graph_name,
                 "tables": len(tables),
                 "columns": len(columns),
-                "foreign_keys": len(fks)
+                "foreign_keys": len(fks),
+                "total_rows": sum(t["row_count"] for t in tables)
             }
         finally:
             self.close()
@@ -192,13 +318,16 @@ class SchemaGraphBuilder:
         
         self._driver.execute_query("MERGE (:Database {name: $name})", name=name)
         
+        # Create Table nodes with row_count
         self._driver.execute_query("""
             MATCH (d:Database {name: $db})
             UNWIND $tables AS tbl
-            MERGE (t:Table {name: tbl})
+            MERGE (t:Table {name: tbl.name})
+            SET t.row_count = tbl.row_count
             MERGE (d)-[:HAS_TABLE]->(t)
         """, db=name, tables=tables)
         
+        # Create Column nodes with all stats
         self._driver.execute_query("""
             UNWIND $columns AS col
             MATCH (t:Table {name: col.table})
@@ -206,7 +335,11 @@ class SchemaGraphBuilder:
             SET c.type = col.type, 
                 c.nullable = col.nullable,
                 c.is_pk = col.is_pk, 
-                c.default = col.default
+                c.default = col.default,
+                c.distinct_count = col.distinct_count,
+                c.sample_values = col.sample_values,
+                c.null_count = col.null_count,
+                c.total_count = col.total_count
             MERGE (t)-[:HAS_COLUMN]->(c)
         """, columns=columns)
         
@@ -219,9 +352,15 @@ class SchemaGraphBuilder:
             """, fks=fks)
 
 
-def create_builder(credentials: PostgresCredentials, neo4j_credentials: Neo4jCredentials) -> SchemaGraphBuilder:
-    """Factory function to create a SchemaGraphBuilder."""
-    connector = PostgresConnector(credentials)
+def create_builder(credentials: PostgresCredentials, neo4j_credentials: Neo4jCredentials, max_workers: int = 5) -> SchemaGraphBuilder:
+    """Factory function to create a SchemaGraphBuilder.
+    
+    Args:
+        credentials: PostgreSQL credentials
+        neo4j_credentials: Neo4j credentials  
+        max_workers: Number of parallel connections for fetching column stats (default: 5)
+    """
+    connector = PostgresConnector(credentials, max_workers=max_workers)
     return SchemaGraphBuilder(connector, neo4j_credentials)
 
 
@@ -249,9 +388,11 @@ if __name__ == "__main__":
     pg_creds = PostgresCredentials.from_supabase(
         project_ref="",
         password="",
-        region="ap-southeast-1"  # Check your dashboard for the correct region
+        region="ap-southeast-1"
     )
     
-    builder = create_builder(pg_creds, neo4j_creds)
-    result = builder.build("my_database")
+    builder = create_builder(pg_creds, neo4j_creds, max_workers=5)
+    
+    # Set include_stats=False for faster extraction without column statistics
+    result = builder.build("my_database", include_stats=True)
     print(f"Built: {result}")
