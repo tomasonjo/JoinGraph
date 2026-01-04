@@ -2,8 +2,8 @@
 Modular Schema Graph Builder
 
 Extracts schema from PostgreSQL databases (including Supabase) and builds a knowledge graph in Neo4j.
-Includes column statistics: distinct count, sample values, null percentage.
-Uses async I/O for concurrent stats fetching.
+Includes column statistics, LLM-generated descriptions, and embeddings.
+Uses async I/O for concurrent operations.
 """
 
 import asyncio
@@ -20,7 +20,7 @@ class PostgresCredentials:
     password: str
     
     @classmethod
-    def from_supabase(cls, project_ref: str, password: str, region: str = "us-east-1") -> "PostgresCredentials":
+    def from_supabase(cls, project_ref: str, password: str, region: str) -> "PostgresCredentials":
         """Create credentials for a Supabase project using the connection pooler."""
         return cls(
             host=f"aws-1-{region}.pooler.supabase.com",
@@ -36,6 +36,77 @@ class Neo4jCredentials:
     uri: str
     user: str
     password: str
+
+
+class SchemaEnricher:
+    """Generates descriptions and embeddings for schema elements using LangChain."""
+    
+    TABLE_PROMPT = """Describe this database table in 1-2 sentences.
+Table: {name}
+Columns: {columns}
+
+Explain what real-world data this table stores and when someone would query it."""
+
+    COLUMN_PROMPT = """Describe this database column in 1-2 sentences.
+Table: {table}
+Column: {name}
+Type: {type}
+Sample Values: {sample_values}
+
+Explain what this column represents in plain business terms."""
+
+    def __init__(self, llm_model: str, embed_model: str, max_concurrency: int):
+        from langchain.chat_models import init_chat_model
+        from langchain.embeddings import init_embeddings
+        
+        self.llm = init_chat_model(llm_model)
+        self.embeddings = init_embeddings(embed_model)
+        self.max_concurrency = max_concurrency
+    
+    async def _generate_description(self, prompt: str, semaphore: asyncio.Semaphore) -> str:
+        """Generate a description using the LLM."""
+        async with semaphore:
+            response = await self.llm.ainvoke(prompt)
+            return response.content.strip()
+    
+    async def _generate_embedding(self, text: str, semaphore: asyncio.Semaphore) -> list[float]:
+        """Generate an embedding for text."""
+        async with semaphore:
+            return await self.embeddings.aembed_query(text)
+    
+    async def enrich_tables(self, tables: list[dict], columns: list[dict]) -> list[dict]:
+        """Add descriptions and embeddings to tables."""
+        sem = asyncio.Semaphore(self.max_concurrency)
+        
+        # Group columns by table
+        cols_by_table = {}
+        for c in columns:
+            cols_by_table.setdefault(c["table"], []).append(c["name"])
+        
+        async def enrich_table(t: dict) -> dict:
+            col_list = ", ".join(cols_by_table.get(t["name"], []))
+            prompt = self.TABLE_PROMPT.format(name=t["name"], columns=col_list)
+            desc = await self._generate_description(prompt, sem)
+            emb = await self._generate_embedding(desc, sem)
+            return {**t, "description": desc, "embedding": emb}
+        
+        return await asyncio.gather(*[enrich_table(t) for t in tables])
+    
+    async def enrich_columns(self, columns: list[dict]) -> list[dict]:
+        """Add descriptions and embeddings to columns."""
+        sem = asyncio.Semaphore(self.max_concurrency)
+        
+        async def enrich_column(c: dict) -> dict:
+            samples = c.get("sample_values", [])[:5]
+            prompt = self.COLUMN_PROMPT.format(
+                table=c["table"], name=c["name"], type=c["type"],
+                sample_values=", ".join(str(s) for s in samples) if samples else "none"
+            )
+            desc = await self._generate_description(prompt, sem)
+            emb = await self._generate_embedding(desc, sem)
+            return {**c, "description": desc, "embedding": emb}
+        
+        return await asyncio.gather(*[enrich_column(c) for c in columns])
 
 
 class PostgresConnector:
@@ -69,7 +140,7 @@ class PostgresConnector:
     WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public';
     """
     
-    def __init__(self, credentials: PostgresCredentials, max_concurrency: int = 10):
+    def __init__(self, credentials: PostgresCredentials, max_concurrency: int):
         self.credentials = credentials
         self.max_concurrency = max_concurrency
         self._pool = None
@@ -93,7 +164,6 @@ class PostgresConnector:
             self._pool = None
     
     async def fetch_tables(self) -> list[dict]:
-        """Fetch tables with row counts."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT table_name FROM information_schema.tables "
@@ -125,14 +195,12 @@ class PostgresConnector:
             ]
     
     async def _fetch_column_stats(self, col: dict, semaphore: asyncio.Semaphore) -> dict:
-        """Fetch stats for a single column with concurrency limit."""
         async with semaphore:
             table, column, col_type = col["table"], col["name"], col["type"]
             stats = {"distinct_count": 0, "sample_values": [], "null_count": 0, "total_count": 0}
             
             try:
                 async with self._pool.acquire() as conn:
-                    # Get total and null counts
                     row = await conn.fetchrow(f'''
                         SELECT COUNT(*) as total, COUNT(*) - COUNT("{column}") as nulls
                         FROM "{table}"
@@ -140,12 +208,10 @@ class PostgresConnector:
                     stats["total_count"] = row["total"]
                     stats["null_count"] = row["nulls"]
                     
-                    # Get distinct count
                     stats["distinct_count"] = await conn.fetchval(
                         f'SELECT COUNT(DISTINCT "{column}") FROM "{table}"'
                     )
                     
-                    # Get sample values (skip binary types)
                     skip_types = ('bytea', 'json', 'jsonb', 'xml')
                     if not any(t in col_type.lower() for t in skip_types):
                         rows = await conn.fetch(f'''
@@ -163,7 +229,6 @@ class PostgresConnector:
             return {**col, **stats}
     
     async def fetch_all_column_stats(self, columns: list[dict]) -> list[dict]:
-        """Fetch statistics for all columns concurrently."""
         semaphore = asyncio.Semaphore(self.max_concurrency)
         tasks = [self._fetch_column_stats(col, semaphore) for col in columns]
         return await asyncio.gather(*tasks)
@@ -172,9 +237,11 @@ class PostgresConnector:
 class SchemaGraphBuilder:
     """Builds a Neo4j schema graph from a PostgreSQL database."""
     
-    def __init__(self, db_connector: PostgresConnector, neo4j_credentials: Neo4jCredentials):
+    def __init__(self, db_connector: PostgresConnector, neo4j_credentials: Neo4jCredentials,
+                 enricher: SchemaEnricher):
         self.connector = db_connector
         self.neo4j_creds = neo4j_credentials
+        self.enricher = enricher
         self._driver = None
     
     def _connect_neo4j(self) -> None:
@@ -188,12 +255,21 @@ class SchemaGraphBuilder:
         if self._driver:
             self._driver.close()
     
-    async def build(self, graph_name: str = "schema", clear: bool = True, include_stats: bool = True) -> dict:
-        """Extract schema and build Neo4j graph."""
+    async def build(self, graph_name: str, clear: bool, 
+                    include_stats: bool, include_descriptions: bool) -> dict:
+        """Extract schema and build Neo4j graph.
+        
+        Args:
+            graph_name: Name for the database node
+            clear: Whether to clear existing schema nodes
+            include_stats: Fetch column statistics (distinct count, samples, etc.)
+            include_descriptions: Generate LLM descriptions and embeddings (requires enricher)
+        """
         await self.connector.connect()
         self._connect_neo4j()
         
         try:
+            print("Fetching schema...")
             tables = await self.connector.fetch_tables()
             columns = await self.connector.fetch_columns()
             fks = await self.connector.fetch_foreign_keys()
@@ -202,6 +278,13 @@ class SchemaGraphBuilder:
                 print(f"Fetching column statistics for {len(columns)} columns...")
                 columns = await self.connector.fetch_all_column_stats(columns)
             
+            if include_descriptions:
+                print(f"Generating descriptions for {len(tables)} tables...")
+                tables = await self.enricher.enrich_tables(tables, columns)
+                print(f"Generating descriptions for {len(columns)} columns...")
+                columns = await self.enricher.enrich_columns(columns)
+            
+            print("Building Neo4j graph...")
             self._build_graph(graph_name, tables, columns, fks, clear)
             
             return {
@@ -222,14 +305,19 @@ class SchemaGraphBuilder:
         
         self._driver.execute_query("MERGE (:Database {name: $name})", name=name)
         
+        # Create Table nodes
         self._driver.execute_query("""
             MATCH (d:Database {name: $db})
             UNWIND $tables AS tbl
             MERGE (t:Table {name: tbl.name})
-            SET t.row_count = tbl.row_count
+            SET t.row_count = tbl.row_count,
+                t.description = tbl.description
             MERGE (d)-[:HAS_TABLE]->(t)
+            WITH t, tbl
+            CALL db.create.setNodeVectorProperty(t, 'embedding', tbl.embedding)
         """, db=name, tables=tables)
         
+        # Create Column nodes
         self._driver.execute_query("""
             UNWIND $columns AS col
             MATCH (t:Table {name: col.table})
@@ -241,8 +329,11 @@ class SchemaGraphBuilder:
                 c.distinct_count = col.distinct_count,
                 c.sample_values = col.sample_values,
                 c.null_count = col.null_count,
-                c.total_count = col.total_count
+                c.total_count = col.total_count,
+                c.description = col.description
             MERGE (t)-[:HAS_COLUMN]->(c)
+            WITH c, col
+            CALL db.create.setNodeVectorProperty(c, 'embedding', col.embedding)
         """, columns=columns)
         
         if fks:
@@ -254,14 +345,17 @@ class SchemaGraphBuilder:
             """, fks=fks)
 
 
-def create_builder(credentials: PostgresCredentials, neo4j_credentials: Neo4jCredentials, max_concurrency: int = 10) -> SchemaGraphBuilder:
-    """Factory function to create a SchemaGraphBuilder.
-    
-    Args:
-        max_concurrency: Max concurrent database queries (default: 10)
-    """
-    connector = PostgresConnector(credentials, max_concurrency=max_concurrency)
-    return SchemaGraphBuilder(connector, neo4j_credentials)
+def create_builder(
+    credentials: PostgresCredentials, 
+    neo4j_credentials: Neo4jCredentials, 
+    max_concurrency: int,
+    llm_model: str,
+    embed_model: str
+) -> SchemaGraphBuilder:
+    """Factory function to create a SchemaGraphBuilder."""
+    connector = PostgresConnector(credentials, max_concurrency)
+    enricher = SchemaEnricher(llm_model, embed_model, max_concurrency)
+    return SchemaGraphBuilder(connector, neo4j_credentials, enricher)
 
 
 async def main():
@@ -272,13 +366,25 @@ async def main():
     )
     
     pg_creds = PostgresCredentials.from_supabase(
-        project_ref="gjmssqesjbwcboybclbl",
-        password="nIFcTJbRNZ8ITnZE",
+        project_ref="",
+        password="",
         region="ap-southeast-1"
     )
     
-    builder = create_builder(pg_creds, neo4j_creds, max_concurrency=10)
-    result = await builder.build("my_database", include_stats=True)
+    builder = create_builder(
+        credentials=pg_creds,
+        neo4j_credentials=neo4j_creds,
+        max_concurrency=5,
+        llm_model="openai:gpt-5-mini",
+        embed_model="openai:text-embedding-3-small"
+    )
+    
+    result = await builder.build(
+        graph_name="my_database",
+        clear=True,
+        include_stats=True,
+        include_descriptions=True
+    )
     print(f"Built: {result}")
 
 
